@@ -1,29 +1,18 @@
-// Confere, do lado do bot, se quem digitou um comando no GoLive tem uma
-// permissão de gerenciamento no grupo — a mesma conta que a API faz (ver
+// Confere, do lado do bot, se quem digitou um comando no GoLive é
+// administrador do grupo — a mesma conta que a API faz (ver
 // docs/guia/permissoes.md#checando-a-permissao-de-quem-usou-o-comando).
 // A API só sabe que É O BOT fazendo a chamada (o bot tem manageWebhooks no
 // grupo — senão a criação do webhook já falha com 403/404); sem esta conta
 // aqui, qualquer membro comum poderia ligar a sala ao Discord usando os
 // poderes do bot.
 
-const SECTIONS = ["manage", "general", "text", "voice"];
-
-function permissionIn(permissions, key) {
-  for (const section of SECTIONS) {
-    const values = permissions?.[section];
-    if (values && key in values) return values[key] === true;
-  }
-  return false;
-}
-
-/** @param {{ group: object, memberRoles: Record<string, string[]> }} groupData a resposta de GET /groups/:id */
-export function hasPermission(groupData, userId, key) {
+/** Só o dono do grupo ou quem tem a permissão de administrador. @param {{ group: object, memberRoles: Record<string, string[]> }} groupData a resposta de GET /groups/:id */
+export function isAdmin(groupData, userId) {
   const { group, memberRoles } = groupData;
   if (group.ownerId === userId) return true;
   const held = new Set(memberRoles?.[userId] ?? []);
   const sets = [group.permissions, ...group.roles.filter((r) => held.has(r.id)).map((r) => r.permissions)];
-  if (sets.some((p) => p?.manage?.administrator)) return true;
-  return sets.some((p) => permissionIn(p, key));
+  return sets.some((p) => p?.manage?.administrator);
 }
 
 // GET /groups/:id a cada checagem seria uma chamada por comando; um minuto de

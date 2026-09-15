@@ -12,10 +12,10 @@
 // "Gerenciar webhooks" nesse grupo — sem isso, o comando vai dar 403/404 e
 // dizer isso mesmo.
 import WebSocket from "ws";
-import { Client, GatewayIntentBits, PermissionFlagsBits, SlashCommandBuilder, WebhookClient } from "discord.js";
+import { Client, GatewayIntentBits, Partials, PermissionFlagsBits, SlashCommandBuilder, WebhookClient } from "discord.js";
 import { addPair, allPairs, findByDiscordChannel, findByGoliveChannel, loadPairs, newPairId, removePairByDiscordChannel } from "./pairs.js";
 import { consumeSync, startFromDiscord, startFromGolive } from "./syncCodes.js";
-import { fetchGroup, hasPermission } from "./golivePermissions.js";
+import { fetchGroup, isAdmin } from "./golivePermissions.js";
 
 const API = "https://apigolive.nemtudo.me";
 const GATEWAY = "wss://apigolive.nemtudo.me/ws";
@@ -36,7 +36,12 @@ const discord = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMessageReactions,
   ],
+  // Reações em mensagens que não estão (mais) no cache chegam "parciais" —
+  // sem isso o discord.js simplesmente ignora o evento em vez de deixar
+  // buscar a reação/mensagem completa com .fetch().
+  partials: [Partials.Message, Partials.Reaction, Partials.Channel],
 });
 
 // Um WebhookClient por ligação, feito na primeira vez que ela é usada e
@@ -52,11 +57,65 @@ function discordWebhookFor(pair) {
   return client;
 }
 
+// ========== Menções ==========
+//
+// Nenhum lado deve conseguir notificar @todos/@everyone, cargos ou uma
+// pessoa específica através do outro — só o texto deve atravessar, nunca o
+// poder de notificar. O webhook do GoLive já não aceita o campo `mentions`
+// (não notifica ninguém por conta própria — ver docs/guia/webhooks.md), mas
+// sua sintaxe de menção em texto (`<@id>`, `<#id>`) é idêntica à do Discord;
+// sem tratar isso, um `<@123...>` do Discord apareceria cru ou, na pior das
+// hipóteses, bateria por acaso com o id de alguém do GoLive. Do lado do
+// Discord, `allowedMentions: { parse: [] }` desliga a notificação de
+// @everyone/@here, cargos e pessoas nas mensagens que chegam do GoLive,
+// venha o que vier no texto.
+const NO_MENTIONS = { parse: [], repliedUser: false };
+
+/** Troca os tokens de menção do Discord por texto simples, pra não virarem uma menção de verdade (ou lixo) do outro lado. */
+function stripDiscordMentions(message) {
+  let text = message.content || "";
+  text = text.replace(/<@!?(\d+)>/g, (m, id) => `@${message.mentions.users.get(id)?.username ?? "usuário"}`);
+  text = text.replace(/<@&(\d+)>/g, (m, id) => `@${message.mentions.roles.get(id)?.name ?? "cargo"}`);
+  text = text.replace(/<#(\d+)>/g, (m, id) => `#${message.mentions.channels.get(id)?.name ?? "canal"}`);
+  // Quebra @everyone/@here com um espaço de largura zero, pra sobrar como
+  // texto e nunca ser lido como uma menção de verdade do outro lado.
+  text = text.replace(/@(everyone|here)/gi, "@​$1");
+  return text;
+}
+
+// ========== Ligação entre mensagens (para as reações) ==========
+//
+// Pra espelhar uma reação, o bot precisa saber a que mensagem do OUTRO lado
+// aquela mensagem corresponde. Guardado só em memória (reinicia zerado, como
+// o resto do estado ao vivo deste bot) e limitado a um teto — como o guia de
+// reações sugere para o próprio estado de reações, aqui é o mesmo motivo:
+// sem limite, a memória cresceria pra sempre.
+const MAX_LINKED_MESSAGES = 2000;
+const linkedByDiscordId = new Map(); // discordMessageId -> link
+const linkedByGoliveId = new Map(); // "groupId:channelId:messageId" -> link
+const linkOrder = [];
+
+function goliveMessageKey(groupId, channelId, messageId) {
+  return `${groupId}:${channelId}:${messageId}`;
+}
+
+function linkMessages({ discordMessageId, discordChannelId, goliveGroupId, goliveChannelId, goliveMessageId }) {
+  const link = { discordMessageId, discordChannelId, goliveGroupId, goliveChannelId, goliveMessageId };
+  linkedByDiscordId.set(discordMessageId, link);
+  linkedByGoliveId.set(goliveMessageKey(goliveGroupId, goliveChannelId, goliveMessageId), link);
+  linkOrder.push(link);
+  if (linkOrder.length > MAX_LINKED_MESSAGES) {
+    const old = linkOrder.shift();
+    linkedByDiscordId.delete(old.discordMessageId);
+    linkedByGoliveId.delete(goliveMessageKey(old.goliveGroupId, old.goliveChannelId, old.goliveMessageId));
+  }
+}
+
 // ========== GoLive → Discord ==========
 // `images` e `attachments` já são URLs públicas (o CDN do GoLive) — o
 // discord.js busca uma URL sozinho quando `attachment` é uma string http(s),
 // então não precisa baixar o arquivo aqui para depois subir de novo.
-async function sendToDiscord(pair, author, text, images = [], attachments = []) {
+async function sendToDiscord(pair, author, text, images = [], attachments = [], goliveMessageId = null) {
   if (!text?.trim() && images.length === 0 && attachments.length === 0) return;
 
   const files = [
@@ -64,13 +123,23 @@ async function sendToDiscord(pair, author, text, images = [], attachments = []) 
     ...attachments.map((a) => ({ attachment: a.url, name: a.name })),
   ];
 
-  await discordWebhookFor(pair).send({
+  const sent = await discordWebhookFor(pair).send({
     content: text.slice(0, 2000),
     username: author.name || author.username || "Usuário GoLive",
     avatarURL: author.avatarUrl || undefined,
-    allowedMentions: { parse: [] }, // evita menções acidentais
+    allowedMentions: NO_MENTIONS, // evita menções acidentais
     ...(files.length > 0 ? { files } : {}),
   });
+
+  if (goliveMessageId) {
+    linkMessages({
+      discordMessageId: sent.id,
+      discordChannelId: pair.discordChannelId,
+      goliveGroupId: pair.goliveGroupId,
+      goliveChannelId: pair.goliveChannelId,
+      goliveMessageId,
+    });
+  }
 }
 
 // GoLive não aceita avatar_url por mensagem — a foto é sempre a foto atual do
@@ -168,15 +237,20 @@ async function convertDiscordAttachments(discordAttachments) {
 }
 
 // ========== Discord → GoLive ==========
-async function sendToGoLive(pair, author, text, discordAttachments = []) {
+async function sendToGoLive(pair, message) {
+  const text = stripDiscordMentions(message);
+  const discordAttachments = [...message.attachments.values()];
   if (!text?.trim() && discordAttachments.length === 0) return;
 
+  const author = message.author;
   await syncGoLiveWebhookAvatar(pair, author.displayAvatarURL?.({ size: 128, extension: "png" }));
   const { images, files } = await convertDiscordAttachments(discordAttachments);
 
+  // ?wait=true devolve a mensagem criada (com o id) — sem isso não dá pra
+  // ligar essa mensagem à sua correspondente no Discord para as reações.
   // Só o username é dinâmico por mensagem; a foto agora acompanha o autor via
   // syncGoLiveWebhookAvatar acima.
-  await fetch(pair.goliveWebhookUrl, {
+  const res = await fetch(`${pair.goliveWebhookUrl}?wait=true`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -186,6 +260,17 @@ async function sendToGoLive(pair, author, text, discordAttachments = []) {
       ...(files.length > 0 ? { files } : {}),
     }),
   });
+
+  const sent = await res.json().catch(() => null);
+  if (sent?.id) {
+    linkMessages({
+      discordMessageId: message.id,
+      discordChannelId: pair.discordChannelId,
+      goliveGroupId: pair.goliveGroupId,
+      goliveChannelId: pair.goliveChannelId,
+      goliveMessageId: sent.id,
+    });
+  }
 }
 
 // ========== Ligar/desligar canais (código de sincronização) ==========
@@ -201,11 +286,16 @@ async function sendToGoLive(pair, author, text, discordAttachments = []) {
 //            /golive-sync codigo:ABC123     → completa com um código do GoLive
 //   GoLive:  !golive-sync                   → gera o código
 //            !golive-sync ABC123            → completa com um código do Discord
+// Todos os comandos exigem administrador — setDefaultMemberPermissions só
+// controla o que aparece pra quem no Discord (um admin do servidor pode
+// liberar o comando pra mais gente nas configurações de Integrações), então
+// cada handler confere de novo com requireAdmin() abaixo antes de fazer
+// qualquer coisa.
 const commands = [
   new SlashCommandBuilder()
     .setName("golive-sync")
     .setDescription("Liga este canal a uma sala do GoLive por código (ou gera um código, sem argumento)")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageWebhooks)
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .setDMPermission(false)
     .addStringOption((o) =>
       o.setName("codigo").setDescription("Código gerado com !golive-sync numa sala do GoLive").setRequired(false)
@@ -213,13 +303,21 @@ const commands = [
   new SlashCommandBuilder()
     .setName("golive-unlink")
     .setDescription("Desliga este canal da sala do GoLive a que ele está ligado")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageWebhooks)
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .setDMPermission(false),
   new SlashCommandBuilder()
     .setName("golive-status")
     .setDescription("Mostra a ligação deste canal com o GoLive, se houver")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .setDMPermission(false),
 ];
+
+/** Confere de novo, no servidor, que quem chamou o comando é administrador — não dá pra confiar só no setDefaultMemberPermissions (é editável pelos admins do servidor). Responde com um erro e retorna false se não for. */
+async function requireAdmin(interaction) {
+  if (interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) return true;
+  await interaction.reply({ content: "🚫 Só administradores do servidor podem usar este comando.", ephemeral: true });
+  return false;
+}
 
 const SYNC_CODE_HELP = "Gere um novo código com `/golive-sync` (Discord, sem código) ou `!golive-sync` (GoLive, sem código) do lado oposto ao que você está completando.";
 
@@ -428,6 +526,7 @@ discord.on("ready", async () => {
 discord.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   try {
+    if (!(await requireAdmin(interaction))) return;
     if (interaction.commandName === "golive-sync") await handleSync(interaction);
     else if (interaction.commandName === "golive-unlink") await handleUnlink(interaction);
     else if (interaction.commandName === "golive-status") await handleStatus(interaction);
@@ -444,18 +543,51 @@ discord.on("messageCreate", async (message) => {
   if (message.webhookId) return; // evita loop de webhooks
 
   if (message.mentions.has(discord.user)) {
-    return void message.reply(TUTORIAL_DISCORD).catch(() => {});
+    return void message.reply({ content: TUTORIAL_DISCORD, allowedMentions: NO_MENTIONS }).catch(() => {});
   }
 
   const pair = findByDiscordChannel(message.channelId);
   if (!pair) return; // canal não ligado a nenhuma sala do GoLive
+  if (!message.content && message.attachments.size === 0) return;
 
-  const text = message.content || "";
-  const attachments = [...message.attachments.values()];
-  if (!text && attachments.length === 0) return;
-
-  await sendToGoLive(pair, message.author, text, attachments);
+  await sendToGoLive(pair, message);
 });
+
+// ========== Reações (Discord → GoLive) ==========
+//
+// O bot só pode mexer na própria reação em cada lado (ver docs/guia/reacoes.md),
+// então "espelhar" é: enquanto pelo menos uma pessoa de verdade tiver aquele
+// emoji na mensagem original, a conta do bot mantém o mesmo emoji na mensagem
+// ligada do outro lado; quando a última pessoa tira o dela, o bot tira o seu.
+async function handleDiscordReactionChange(reaction, user) {
+  if (user.bot) return;
+  try {
+    if (reaction.partial) await reaction.fetch();
+  } catch {
+    return;
+  }
+  if (reaction.emoji.id) return; // emoji personalizado — o GoLive só aceita unicode
+
+  const link = linkedByDiscordId.get(reaction.message.id);
+  if (!link) return;
+
+  const hasReal = reaction.count - (reaction.me ? 1 : 0) > 0;
+  try {
+    await fetch(
+      `${API}/groups/${link.goliveGroupId}/channels/${link.goliveChannelId}/messages/${link.goliveMessageId}/reactions`,
+      {
+        method: "POST",
+        headers: { Authorization: GOLIVE_TOKEN, "Content-Type": "application/json" },
+        body: JSON.stringify({ emoji: reaction.emoji.name, on: hasReal }),
+      }
+    );
+  } catch (err) {
+    console.error("Erro espelhando reação no GoLive:", err);
+  }
+}
+
+discord.on("messageReactionAdd", handleDiscordReactionChange);
+discord.on("messageReactionRemove", handleDiscordReactionChange);
 
 // ========== Comando do lado do GoLive (!golive-sync) ==========
 //
@@ -483,8 +615,8 @@ async function handleGoliveSyncCommand(message, author) {
   }
 
   const groupData = await fetchGroup(API, GOLIVE_TOKEN, message.groupId);
-  if (!groupData || !hasPermission(groupData, author.id, "manageWebhooks")) {
-    return goliveReply(message, "🚫 Você precisa da permissão **Gerenciar webhooks** neste grupo pra ligar esta sala ao Discord.");
+  if (!groupData || !isAdmin(groupData, author.id)) {
+    return goliveReply(message, "🚫 Você precisa ser **administrador** deste grupo pra ligar esta sala ao Discord.");
   }
 
   const code = message.text.trim().slice(GOLIVE_SYNC_PREFIX.length).trim();
@@ -509,6 +641,45 @@ async function handleGoliveSyncCommand(message, author) {
     createdBy: author.id,
   });
   await goliveReply(message, result.ok ? SYNC_DONE_MESSAGE : `❌ ${result.message}`);
+}
+
+// ========== Reações (GoLive → Discord) ==========
+//
+// O evento `group-message-reactions` traz o estado inteiro das reações da
+// mensagem, não quem mudou o quê (ver docs/guia/reacoes.md) — por isso cada
+// link guarda, em `mirroredEmojis`, quais emoji tinham pelo menos uma pessoa
+// de verdade (ou seja, alguém além do próprio bot) da última vez, pra saber
+// o que apareceu e o que sumiu desta vez.
+async function ensureDiscordReaction(link, emoji, on) {
+  try {
+    const channel = await discord.channels.fetch(link.discordChannelId);
+    const message = await channel.messages.fetch(link.discordMessageId);
+    const existing = message.reactions.cache.get(emoji);
+    const alreadyOn = existing?.me ?? false;
+    if (on && !alreadyOn) await message.react(emoji);
+    else if (!on && alreadyOn) await existing.users.remove(discord.user.id);
+  } catch (err) {
+    console.error("Erro espelhando reação no Discord:", err);
+  }
+}
+
+async function handleGoliveReactionsChanged(event) {
+  const link = linkedByGoliveId.get(goliveMessageKey(event.groupId, event.channelId, event.messageId));
+  if (!link) return;
+
+  const current = new Set();
+  for (const r of event.reactions ?? []) {
+    if (r.users.some((id) => id !== meId)) current.add(r.emoji);
+  }
+  const previous = link.mirroredEmojis ?? new Set();
+
+  for (const emoji of current) {
+    if (!previous.has(emoji)) await ensureDiscordReaction(link, emoji, true);
+  }
+  for (const emoji of previous) {
+    if (!current.has(emoji)) await ensureDiscordReaction(link, emoji, false);
+  }
+  link.mirroredEmojis = current;
 }
 
 // ========== Cliente GoLive (WebSocket) ==========
@@ -547,7 +718,12 @@ function connectGoLive() {
       const pair = findByGoliveChannel(message.groupId, message.channelId);
       if (!pair) return; // sala não ligada a nenhum canal do Discord
 
-      await sendToDiscord(pair, author, message.text, message.images ?? [], message.attachments ?? []);
+      await sendToDiscord(pair, author, message.text, message.images ?? [], message.attachments ?? [], message.id);
+      return;
+    }
+
+    if (event.type === "group-message-reactions") {
+      await handleGoliveReactionsChanged(event);
     }
   });
 

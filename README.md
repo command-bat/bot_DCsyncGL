@@ -15,7 +15,7 @@ o mesmo canal de nenhum dos dois lados.
 | `index.js` | Tudo que roda: os dois clientes (Discord e GoLive), os comandos, e a ponte de mensagens em si. |
 | `pairs.js` | As ligações ativas — carregadas de `pairs.json` ao iniciar, uma escrita nesse arquivo a cada mudança. Garante o 1-para-1: `addPair` recusa uma ligação cujo canal do Discord ou sala do GoLive já esteja em outra. |
 | `syncCodes.js` | Os códigos de sincronização usados pra ligar um canal a uma sala (ver abaixo) — só em memória, cada um dura 10 minutos. |
-| `golivePermissions.js` | Confere se quem digitou um comando *no GoLive* tem a permissão necessária naquele grupo — a mesma conta que a API faz, do lado do bot. |
+| `golivePermissions.js` | Confere se quem digitou um comando *no GoLive* é administrador daquele grupo — a mesma conta que a API faz, do lado do bot. |
 | `pairs.json` | Criado sozinho na primeira ligação. Não é versionado (está no `.gitignore`): carrega o endereço de cada webhook, que é uma senha. |
 
 ## Como uma ligação é feita
@@ -56,9 +56,11 @@ vencer.
 | Discord | `/golive-status` | Mostra a qual sala do GoLive o canal atual está ligado, se houver. |
 | GoLive | `!golive-sync` | O espelho do `/golive-sync` do Discord — sem argumento gera um código, com um código completa. |
 
-`/golive-sync` e `/golive-unlink` exigem a permissão **Gerenciar Webhooks** do
-Discord (o próprio Discord bloqueia quem não tem); `!golive-sync` confere a
-permissão **Gerenciar webhooks** do GoLive antes de fazer qualquer coisa (ver
+Todos os comandos exigem **administrador**: os três comandos do Discord (o
+próprio Discord bloqueia quem não tem, mas o bot confere de novo do lado dele,
+já que um admin do servidor pode liberar o comando pra mais gente nas
+configurações de Integrações) e `!golive-sync` confere que quem digitou é
+administrador do grupo no GoLive antes de fazer qualquer coisa (ver
 `golivePermissions.js`).
 
 ## O que é sincronizado, e como
@@ -77,19 +79,43 @@ Uma vez ligados, `index.js` ouve as duas pontas:
 - **GoLive → Discord** (evento `group-message` do WebSocket): texto, fotos e
   arquivos, mandados pro `WebhookClient` do Discord — que busca as URLs do
   CDN do GoLive direto, sem baixar e re-enviar nada.
+- **Reações**, nas duas direções: como o bot só pode mexer na própria reação
+  (nunca na de outra pessoa — regra de ambas as plataformas), "espelhar" é
+  manter o mesmo emoji da conta do bot na mensagem ligada do outro lado
+  enquanto pelo menos uma pessoa de verdade reagiu com ele, e tirar assim
+  que a última pessoa tira a dela. Só emoji Unicode são espelhados — o
+  GoLive não tem emoji personalizado.
 
 Mensagens de outros webhooks e bots nunca são retransmitidas — é o que evita
 um eco infinito entre os dois lados.
 
+### Menções
+
+Nenhum lado consegue notificar `@everyone`/`@here`, cargos ou uma pessoa
+através do outro — só o texto atravessa, nunca o poder de notificar:
+
+- **Discord → GoLive:** o webhook do GoLive já não aceita menções de
+  jeito nenhum (não notifica ninguém — ver `docs/guia/webhooks.md`), mas a
+  sintaxe de menção em texto é idêntica à do Discord (`<@id>`, `<#id>`), então
+  o bot troca cada menção do Discord por texto simples (`@nome`, `#canal`)
+  antes de mandar, e quebra `@everyone`/`@here` digitados à mão.
+- **GoLive → Discord:** toda mensagem que o webhook manda vai com
+  `allowedMentions: { parse: [] }`, que desliga a notificação de
+  `@everyone`/`@here`, cargos e pessoas não importa o que vier no texto.
+
 ## Requisitos de permissão
 
 - **No Discord:** o bot precisa ser convidado com os escopos `bot` e
-  `applications.commands`, e a permissão **Gerenciar Webhooks** — sem ela,
-  completar uma sincronização falha ao tentar criar o webhook do canal.
+  `applications.commands`, e as permissões **Gerenciar Webhooks** (sem ela,
+  completar uma sincronização falha ao tentar criar o webhook do canal),
+  **Adicionar Reações** e **Ler Histórico de Mensagens** (para espelhar as
+  reações que vêm do GoLive).
 - **No GoLive:** a conta do bot (a que o `GOLIVE_TOKEN` autentica) precisa ser
-  **adicionada a cada grupo** que for usado, com a permissão **Gerenciar
-  webhooks** *naquele grupo* — sem isso, a API responde `403`/`404` na hora de
-  criar o webhook, e é exatamente essa mensagem que o comando devolve.
+  **adicionada a cada grupo** que for usado, com as permissões **Gerenciar
+  webhooks** *naquele grupo* (sem isso, a API responde `403`/`404` na hora de
+  criar o webhook, e é exatamente essa mensagem que o comando devolve) e
+  **Adicionar reações** (`addReactions`) para espelhar as reações que vêm do
+  Discord.
 
 ## Configuração
 
