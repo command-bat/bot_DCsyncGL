@@ -34,7 +34,27 @@ const GATEWAY = "wss://apigolive.nemtudo.me/ws";
 
 const DISCORD_INVITE_URL = "https://discord.com/oauth2/authorize?client_id=1549460926753935482";
 const GOLIVE_INVITE_URL = "https://golive.nemtudo.me/bots/b2ad8d4d-bacb-4556-bef8-496e1c00e7ab/add";
-const SUPPORT_SERVER_URL = "http://discord.gg/nemtudo";
+const SUPPORT_SERVER_URL = "https://discord.gg/nemtudo";
+const GOLIVE_WEB_URL = "https://golive.nemtudo.me";
+const DEFAULT_GOLIVE_AVATAR = `${GOLIVE_WEB_URL}/assets/default_avatars/01.png`;
+
+function resolveGoliveAvatarUrl(avatarUrl) {
+  if (!avatarUrl || typeof avatarUrl !== "string") return DEFAULT_GOLIVE_AVATAR;
+  const raw = avatarUrl.split("#")[0].trim();
+  if (!raw) return DEFAULT_GOLIVE_AVATAR;
+  if (/^https?:\/\//i.test(raw)) return raw;
+  const path = raw.startsWith("/") ? raw : `/${raw}`;
+  return `${GOLIVE_WEB_URL}${path}`;
+}
+
+function resolveGoliveMediaUrl(url) {
+  if (!url || typeof url !== "string") return url;
+  const trimmed = url.trim();
+  if (!trimmed) return trimmed;
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  const path = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  return `${GOLIVE_WEB_URL}${path}`;
+}
 
 function createInviteButtons() {
   return new ActionRowBuilder().addComponents(
@@ -143,24 +163,57 @@ function sanitizeDiscordToGoLive(message) {
   return text;
 }
 
+const knownGoliveUsers = new Map(); // id -> { name, username }
+
+function recordGoliveUsers(users) {
+  if (!users) return;
+  if (Array.isArray(users)) {
+    for (const u of users) {
+      if (u?.id) {
+        knownGoliveUsers.set(u.id, { name: u.name || u.displayName, username: u.username });
+      }
+    }
+  } else if (typeof users === "object") {
+    for (const [id, u] of Object.entries(users)) {
+      if (u) {
+        knownGoliveUsers.set(id, {
+          name: typeof u === "string" ? u : u.name || u.displayName,
+          username: typeof u === "string" ? u : u.username,
+        });
+      }
+    }
+  }
+}
+
 /**
  * Sanitiza o texto vindo do GoLive antes de enviar ao Discord.
- * Bloqueia menções de @everyone, @here, @todos, @online, @offline, tokens <@id>
- * e menções a pessoas (@nome) para que NUNCA notifiquem ninguém no Discord.
+ * Substitui tokens de menção <@id> pelo nome real da pessoa (@Nome) com zero-width space (\u200B)
+ * para que NUNCA notifiquem ninguém no Discord, mantendo a legibilidade visual exata.
+ * Também neutraliza @everyone, @here, @todos, @online, @offline e @cargos.
  */
-function sanitizeGoLiveToDiscord(text) {
+function sanitizeGoLiveToDiscord(text, mentionedUsers = null) {
   if (!text || typeof text !== "string") return "";
+  if (mentionedUsers) recordGoliveUsers(mentionedUsers);
   let clean = text;
 
-  // Neutraliza tokens de menção <@id>, <@!id>, <@&id>, <#id>
-  clean = clean.replace(/<@!?([a-zA-Z0-9_-]+)>/g, "@\u200Busuário");
+  // Substitui tokens de menção <@id> pelo nome real da pessoa, neutralizado com \u200B para não pingar
+  clean = clean.replace(/<@!?([a-zA-Z0-9_-]+)>/g, (match, id) => {
+    const user = (mentionedUsers && (mentionedUsers[id] || mentionedUsers.get?.(id))) || knownGoliveUsers.get(id);
+    const name = typeof user === "string" ? user : user?.name || user?.username || user?.displayName;
+    if (name) {
+      return `@\u200B${name}`;
+    }
+    return "@\u200Busuário";
+  });
+
+  // Neutraliza tokens de cargos e canais
   clean = clean.replace(/<@&([a-zA-Z0-9_-]+)>/g, "@\u200Bcargo");
   clean = clean.replace(/<#([a-zA-Z0-9_-]+)>/g, "#\u200Bcanal");
 
   // Neutraliza menções de broadcast
   clean = clean.replace(/@(everyone|here|todos|online|offline)/gi, "@\u200B$1");
 
-  // Neutraliza qualquer menção a pessoas (@nome), inserindo zero-width space após o @
+  // Neutraliza qualquer menção a pessoas (@nome), inserindo zero-width space após o @ se já não tiver
   clean = clean.replace(/@(?!\u200B)([\p{L}\p{N}_])/gu, "@\u200B$1");
 
   return clean;
@@ -182,8 +235,8 @@ function goliveMessageKey(groupId, channelId, messageId) {
   return `${groupId}:${channelId}:${messageId}`;
 }
 
-function linkMessages({ discordMessageId, discordChannelId, goliveGroupId, goliveChannelId, goliveMessageId }) {
-  const link = { discordMessageId, discordChannelId, goliveGroupId, goliveChannelId, goliveMessageId };
+function linkMessages({ discordMessageId, discordChannelId, goliveGroupId, goliveChannelId, goliveMessageId, goliveWebhookUrl }) {
+  const link = { discordMessageId, discordChannelId, goliveGroupId, goliveChannelId, goliveMessageId, goliveWebhookUrl };
   linkedByDiscordId.set(discordMessageId, link);
   linkedByGoliveId.set(goliveMessageKey(goliveGroupId, goliveChannelId, goliveMessageId), link);
   linkOrder.push(link);
@@ -206,36 +259,36 @@ function unlinkMessages(link) {
 // então não precisa baixar o arquivo aqui para depois subir de novo.
 async function sendToDiscord(pair, author, text, images = [], attachments = [], goliveMessageId = null, extra = {}) {
   try {
-    const cleanText = sanitizeGoLiveToDiscord(typeof text === "string" ? text : "");
+    const cleanText = sanitizeGoLiveToDiscord(typeof text === "string" ? text : "", extra.mentioned);
     const cleanImages = Array.isArray(images) ? images : [];
     const cleanAttachments = Array.isArray(attachments) ? attachments : [];
 
     const files = [
-      ...cleanImages.map((url) => ({ attachment: url })),
-      ...cleanAttachments.map((a) => ({ attachment: a.url, name: a.name })),
+      ...cleanImages.map((url) => ({ attachment: resolveGoliveMediaUrl(url) })),
+      ...cleanAttachments.map((a) => ({ attachment: resolveGoliveMediaUrl(a.url), name: a.name })),
     ];
 
     if (extra.gifUrl) {
-      files.push({ attachment: extra.gifUrl });
+      files.push({ attachment: resolveGoliveMediaUrl(extra.gifUrl) });
     }
 
     if (!cleanText.trim() && files.length === 0) return;
 
     let content = cleanText ? cleanText.slice(0, 2000) : undefined;
     if (extra.replyTo?.name && extra.replyTo?.text) {
-      const quoteAuthor = sanitizeGoLiveToDiscord(extra.replyTo.name);
-      const quoteText = sanitizeGoLiveToDiscord(String(extra.replyTo.text).slice(0, 100).replace(/\n/g, " "));
+      const quoteAuthor = sanitizeGoLiveToDiscord(extra.replyTo.name, extra.mentioned);
+      const quoteText = sanitizeGoLiveToDiscord(String(extra.replyTo.text).slice(0, 100).replace(/\n/g, " "), extra.mentioned);
       const quote = `> 💬 **${quoteAuthor}**: ${quoteText}\n`;
       content = quote + (content || "");
       if (content.length > 2000) content = content.slice(0, 2000);
     }
 
     const client = discordWebhookFor(pair);
-    const authorName = sanitizeGoLiveToDiscord(author?.name || author?.username || "Usuário GoLive").slice(0, 80);
+    const authorName = sanitizeGoLiveToDiscord(author?.name || author?.username || "Usuário GoLive", extra.mentioned).slice(0, 80);
     const sent = await client.send({
       content: content || undefined,
       username: authorName,
-      avatarURL: author?.avatarUrl || undefined,
+      avatarURL: resolveGoliveAvatarUrl(author?.avatarUrl || author?.avatar),
       allowedMentions: NO_MENTIONS, // desliga completamente qualquer menção/ping
       ...(files.length > 0 ? { files } : {}),
     });
@@ -247,6 +300,7 @@ async function sendToDiscord(pair, author, text, images = [], attachments = [], 
         goliveGroupId: pair.goliveGroupId,
         goliveChannelId: pair.goliveChannelId,
         goliveMessageId,
+        goliveWebhookUrl: pair.goliveWebhookUrl,
       });
     }
   } catch (err) {
@@ -424,6 +478,7 @@ async function sendToGoLive(pair, message) {
         goliveGroupId: pair.goliveGroupId,
         goliveChannelId: pair.goliveChannelId,
         goliveMessageId: sent.id,
+        goliveWebhookUrl: pair.goliveWebhookUrl,
       });
     }
   } catch (err) {
@@ -603,7 +658,7 @@ async function completeSync({ discordGuildId, discordChannelId, goliveGroupId, g
     const client = discordWebhookFor(pair);
     await client.send({
       username: "GoLive Sync",
-      content: "🔗 **Conexão estabelecida!** As mensagens enviadas neste canal agora são sincronizadas em tempo real com o GoLive.\n*(Bot em Beta Teste • Suporte: <http://discord.gg/nemtudo>)*",
+      content: "🔗 **Conexão estabelecida!** As mensagens enviadas neste canal agora são sincronizadas em tempo real com o GoLive.\n*(Bot em Beta Teste • Suporte: <https://discord.gg/nemtudo>)*",
       allowedMentions: NO_MENTIONS,
     }).catch(() => {});
   } catch {}
@@ -615,7 +670,7 @@ async function completeSync({ discordGuildId, discordChannelId, goliveGroupId, g
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         username: "GoLive Sync",
-        content: "🔗 **Conexão estabelecida!** As mensagens enviadas nesta sala agora são sincronizadas em tempo real com o Discord.\n*(Bot em Beta Teste • Suporte: http://discord.gg/nemtudo)*",
+        content: "🔗 **Conexão estabelecida!** As mensagens enviadas nesta sala agora são sincronizadas em tempo real com o Discord.\n*(Bot em Beta Teste • Suporte: https://discord.gg/nemtudo)*",
       }),
       signal: AbortSignal.timeout(10000),
     }).catch(() => {});
@@ -875,13 +930,60 @@ discord.on("messageUpdate", async (oldMessage, newMessage) => {
     const link = linkedByDiscordId.get(newMessage.id);
     if (!link) return;
 
+    const pair = findByDiscordChannel(newMessage.channelId);
+    const webhookUrl = link.goliveWebhookUrl || pair?.goliveWebhookUrl;
+
+    let replyQuote = "";
+    if (newMessage.reference?.messageId) {
+      try {
+        const refMsg = await newMessage.channel.messages.fetch(newMessage.reference.messageId).catch(() => null);
+        if (refMsg) {
+          const refAuthor = sanitizeDiscordToGoLive(refMsg.author?.displayName || refMsg.author?.username || "Usuário");
+          let refText = sanitizeDiscordToGoLive((refMsg.content || "").slice(0, 100).replace(/\r?\n/g, " "));
+          if (!refText && refMsg.attachments?.size > 0) refText = "[Anexo]";
+          else if (!refText && refMsg.stickers?.size > 0) refText = "[Figurinha]";
+          if (refText) {
+            replyQuote = `> 💬 **${refAuthor}**: ${refText}\n`;
+          }
+        }
+      } catch {}
+    }
+
     const text = sanitizeDiscordToGoLive(newMessage);
-    await fetch(`${API}/groups/${link.goliveGroupId}/channels/${link.goliveChannelId}/messages/${link.goliveMessageId}`, {
-      method: "PATCH",
-      headers: { Authorization: GOLIVE_TOKEN, "Content-Type": "application/json" },
-      body: JSON.stringify({ text: text.slice(0, 2000) }),
-      signal: AbortSignal.timeout(10000),
-    }).catch((err) => console.error("Erro sincronizando edição pro GoLive:", err));
+    const fullContent = (replyQuote + (text || "")).slice(0, 2000);
+
+    // Tenta primeiro via endpoint direto de webhook (PATCH /webhooks/:id/:token/messages/:mid)
+    let updated = false;
+    if (webhookUrl) {
+      try {
+        const webhookRes = await fetch(`${webhookUrl}/messages/${link.goliveMessageId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: fullContent, text: fullContent }),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (webhookRes.ok) {
+          updated = true;
+        }
+      } catch {}
+    }
+
+    // Fallback: rota de grupos com token do bot (PATCH /groups/:id/channels/:cid/messages/:mid)
+    if (!updated) {
+      const res = await fetch(
+        `${API}/groups/${link.goliveGroupId}/channels/${link.goliveChannelId}/messages/${link.goliveMessageId}`,
+        {
+          method: "PATCH",
+          headers: { Authorization: GOLIVE_TOKEN, "Content-Type": "application/json" },
+          body: JSON.stringify({ text: fullContent }),
+          signal: AbortSignal.timeout(10000),
+        }
+      );
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        console.warn(`GoLive message PATCH retornou status ${res.status}: ${errText}`);
+      }
+    }
   } catch (err) {
     console.error("Erro em messageUpdate Discord:", err);
   }
@@ -894,11 +996,38 @@ discord.on("messageDelete", async (message) => {
 
     unlinkMessages(link);
 
-    await fetch(`${API}/groups/${link.goliveGroupId}/channels/${link.goliveChannelId}/messages/${link.goliveMessageId}`, {
-      method: "DELETE",
-      headers: { Authorization: GOLIVE_TOKEN },
-      signal: AbortSignal.timeout(10000),
-    }).catch((err) => console.error("Erro sincronizando exclusão pro GoLive:", err));
+    const pair = findByDiscordChannel(message.channelId);
+    const webhookUrl = link.goliveWebhookUrl || pair?.goliveWebhookUrl;
+
+    // Tenta primeiro via endpoint direto de webhook (DELETE /webhooks/:id/:token/messages/:mid)
+    let deleted = false;
+    if (webhookUrl) {
+      try {
+        const webhookRes = await fetch(`${webhookUrl}/messages/${link.goliveMessageId}`, {
+          method: "DELETE",
+          signal: AbortSignal.timeout(10000),
+        });
+        if (webhookRes.ok) {
+          deleted = true;
+        }
+      } catch {}
+    }
+
+    // Fallback: rota de grupos com token do bot (DELETE /groups/:id/channels/:cid/messages/:mid)
+    if (!deleted) {
+      const res = await fetch(
+        `${API}/groups/${link.goliveGroupId}/channels/${link.goliveChannelId}/messages/${link.goliveMessageId}`,
+        {
+          method: "DELETE",
+          headers: { Authorization: GOLIVE_TOKEN },
+          signal: AbortSignal.timeout(10000),
+        }
+      );
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        console.warn(`GoLive message DELETE retornou status ${res.status}: ${errText}`);
+      }
+    }
   } catch (err) {
     console.error("Erro em messageDelete Discord:", err);
   }
@@ -1130,11 +1259,14 @@ function connectGoLive() {
     }
 
     if (event.type === "group-message") {
-      const { message, author } = event;
+      const { message, author, mentioned } = event;
       if (!message || !author) return;
 
       // Ignora bots e webhooks (evita loop)
       if (author.bot || author.webhook) return;
+
+      if (author) recordGoliveUsers([author]);
+      if (mentioned) recordGoliveUsers(mentioned);
 
       const rawText = (message.text || "").trim();
       // Remove menção do bot no início se houver (ex: "@bot !golive-sync")
@@ -1180,14 +1312,16 @@ function connectGoLive() {
         {
           gifUrl: message.kind === "gif" ? message.url : undefined,
           replyTo: message.replyTo,
+          mentioned,
         }
       );
       return;
     }
 
     if (event.type === "group-message-updated") {
-      const { groupId, channelId, message } = event;
+      const { groupId, channelId, message, mentioned } = event;
       if (!groupId || !channelId || !message?.id) return;
+      if (mentioned) recordGoliveUsers(mentioned);
 
       const key = goliveMessageKey(groupId, channelId, message.id);
       const link = linkedByGoliveId.get(key);
@@ -1198,7 +1332,7 @@ function connectGoLive() {
 
       try {
         const client = discordWebhookFor(pair);
-        const cleanText = sanitizeGoLiveToDiscord(typeof message.text === "string" ? message.text : "").slice(0, 2000);
+        const cleanText = sanitizeGoLiveToDiscord(typeof message.text === "string" ? message.text : "", mentioned).slice(0, 2000);
         if (cleanText) {
           await client.editMessage(link.discordMessageId, {
             content: cleanText,

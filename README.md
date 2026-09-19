@@ -100,7 +100,7 @@ um eco infinito entre os dois lados.
 Nenhum lado consegue notificar `@everyone`, `@here`, `@todos`, cargos ou pessoas específicas através do outro aplicativo:
 
 - **Discord → GoLive:** Qualquer token de menção (`<@id>`, `<@&id>`, `<#id>`) ou menção em texto (`@everyone`, `@here`, `@todos`, `@online`, `@offline`, e qualquer `@Nome` de usuário) recebe um espaço invisível de largura zero (`@\u200BNome`). Com isso, a mensagem permanece legível visualmente, mas o GoLive **nunca** a interpreta como menção, não gera notificações push, nem alertas sonoros de menção na sala.
-- **GoLive → Discord:** Qualquer menção de broadcast (`@everyone`, `@here`, `@todos`, etc.), tokens `<@id>` ou menção a usuários (`@Nome`) também é neutralizada com zero-width space antes de ser enviada ao Discord. Além disso, o envio do webhook utiliza `allowedMentions: { parse: [], users: [], roles: [], repliedUser: false }`, garantindo que nenhuma menção ou ping atinja membros no Discord.
+- **GoLive → Discord:** Tokens de menção (`<@id>`) são convertidos para o nome real da pessoa (`@\u200BNome`) usando os dados dos membros do GoLive, mas com um espaço invisível de largura zero (`\u200B`) logo após o `@`. Qualquer menção de broadcast (`@everyone`, `@here`, `@todos`, etc.) ou texto `@Nome` também recebe o zero-width space. Além disso, o envio do webhook utiliza `allowedMentions: { parse: [], users: [], roles: [], repliedUser: false }`, garantindo que o nome da pessoa apareça de forma limpa e legível sem disparar notificações ou pings a ninguém no Discord.
 
 ## Requisitos de permissão
 
@@ -149,5 +149,5 @@ hora para aparecer em todo lugar, é assim que o Discord funciona.
 Este bot está atualmente em fase de **Beta Teste**. Se você encontrar qualquer inconsistência, bug ou precisar de suporte na configuração dos canais ou permissões:
 
 - Abra um **ticket de suporte** no servidor oficial do **NemTudo** no Discord:
-  👉 **[discord.gg/nemtudo](http://discord.gg/nemtudo)**
+  👉 **[discord.gg/nemtudo](https://discord.gg/nemtudo)**
 
