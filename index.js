@@ -11,18 +11,53 @@
 // precisa ser adicionada a cada grupo que for usado, com a permissão
 // "Gerenciar webhooks" nesse grupo — sem isso, o comando vai dar 403/404 e
 // dizer isso mesmo.
+import "dotenv/config";
 import WebSocket from "ws";
-import { Client, GatewayIntentBits, Partials, PermissionFlagsBits, SlashCommandBuilder, WebhookClient } from "discord.js";
-import { addPair, allPairs, findByDiscordChannel, findByGoliveChannel, loadPairs, newPairId, removePairByDiscordChannel } from "./pairs.js";
+import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  Client,
+  EmbedBuilder,
+  GatewayIntentBits,
+  Partials,
+  PermissionFlagsBits,
+  SlashCommandBuilder,
+  WebhookClient,
+} from "discord.js";
+import { addPair, allPairs, findByDiscordChannel, findByGoliveChannel, loadPairs, newPairId, removePairByDiscordChannel, removePairByGoliveChannel } from "./pairs.js";
 import { consumeSync, startFromDiscord, startFromGolive } from "./syncCodes.js";
 import { fetchGroup, isAdmin } from "./golivePermissions.js";
 
 const API = "https://apigolive.nemtudo.me";
 const GATEWAY = "wss://apigolive.nemtudo.me/ws";
 
+const DISCORD_INVITE_URL = "https://discord.com/oauth2/authorize?client_id=1549460926753935482";
+const GOLIVE_INVITE_URL = "https://golive.nemtudo.me/bots/b2ad8d4d-bacb-4556-bef8-496e1c00e7ab/add";
+const SUPPORT_SERVER_URL = "http://discord.gg/nemtudo";
+
+function createInviteButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setLabel("Adicionar ao Discord")
+      .setStyle(ButtonStyle.Link)
+      .setURL(DISCORD_INVITE_URL),
+    new ButtonBuilder()
+      .setLabel("Adicionar ao GoLive")
+      .setStyle(ButtonStyle.Link)
+      .setURL(GOLIVE_INVITE_URL),
+    new ButtonBuilder()
+      .setLabel("Suporte (NemTudo)")
+      .setStyle(ButtonStyle.Link)
+      .setURL(SUPPORT_SERVER_URL)
+  );
+}
+
 const GOLIVE_TOKEN = process.env.GOLIVE_TOKEN?.startsWith("Bot ")
   ? process.env.GOLIVE_TOKEN
   : `Bot ${process.env.GOLIVE_TOKEN}`;
+
+  console.log(GOLIVE_TOKEN)
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 
@@ -67,20 +102,68 @@ function discordWebhookFor(pair) {
 // sem tratar isso, um `<@123...>` do Discord apareceria cru ou, na pior das
 // hipóteses, bateria por acaso com o id de alguém do GoLive. Do lado do
 // Discord, `allowedMentions: { parse: [] }` desliga a notificação de
-// @everyone/@here, cargos e pessoas nas mensagens que chegam do GoLive,
-// venha o que vier no texto.
-const NO_MENTIONS = { parse: [], repliedUser: false };
+const NO_MENTIONS = { parse: [], users: [], roles: [], repliedUser: false };
 
-/** Troca os tokens de menção do Discord por texto simples, pra não virarem uma menção de verdade (ou lixo) do outro lado. */
-function stripDiscordMentions(message) {
-  let text = message.content || "";
-  text = text.replace(/<@!?(\d+)>/g, (m, id) => `@${message.mentions.users.get(id)?.username ?? "usuário"}`);
-  text = text.replace(/<@&(\d+)>/g, (m, id) => `@${message.mentions.roles.get(id)?.name ?? "cargo"}`);
-  text = text.replace(/<#(\d+)>/g, (m, id) => `#${message.mentions.channels.get(id)?.name ?? "canal"}`);
-  // Quebra @everyone/@here com um espaço de largura zero, pra sobrar como
-  // texto e nunca ser lido como uma menção de verdade do outro lado.
-  text = text.replace(/@(everyone|here)/gi, "@​$1");
+/**
+ * Sanitiza o texto do Discord antes de enviar ao GoLive.
+ * Bloqueia menções de @everyone, @here, @todos, @online, @offline e menções de pessoas
+ * para que NUNCA passem como menção ativa para o GoLive (usa zero-width space para manter legível).
+ */
+function sanitizeDiscordToGoLive(message) {
+  let text = typeof message === "string" ? message : message?.content || "";
+
+  if (typeof message === "object" && message?.mentions) {
+    text = text.replace(/<@!?(\d+)>/g, (m, id) => {
+      const user = message.mentions.users?.get?.(id);
+      const name = user?.displayName || user?.username || "usuário";
+      return `@\u200B${name}`;
+    });
+    text = text.replace(/<@&(\d+)>/g, (m, id) => {
+      const role = message.mentions.roles?.get?.(id);
+      const name = role?.name || "cargo";
+      return `@\u200B${name}`;
+    });
+    text = text.replace(/<#(\d+)>/g, (m, id) => {
+      const channel = message.mentions.channels?.get?.(id);
+      const name = channel?.name || "canal";
+      return `#\u200B${name}`;
+    });
+  } else {
+    text = text.replace(/<@!?(\d+)>/g, "@\u200Busuário");
+    text = text.replace(/<@&(\d+)>/g, "@\u200Bcargo");
+    text = text.replace(/<#(\d+)>/g, "#\u200Bcanal");
+  }
+
+  // Neutraliza menções de broadcast (@everyone, @here, @todos, @online, @offline)
+  text = text.replace(/@(everyone|here|todos|online|offline)/gi, "@\u200B$1");
+
+  // Neutraliza qualquer menção a pessoas (@nome), inserindo zero-width space após o @
+  text = text.replace(/@(?!\u200B)([\p{L}\p{N}_])/gu, "@\u200B$1");
+
   return text;
+}
+
+/**
+ * Sanitiza o texto vindo do GoLive antes de enviar ao Discord.
+ * Bloqueia menções de @everyone, @here, @todos, @online, @offline, tokens <@id>
+ * e menções a pessoas (@nome) para que NUNCA notifiquem ninguém no Discord.
+ */
+function sanitizeGoLiveToDiscord(text) {
+  if (!text || typeof text !== "string") return "";
+  let clean = text;
+
+  // Neutraliza tokens de menção <@id>, <@!id>, <@&id>, <#id>
+  clean = clean.replace(/<@!?([a-zA-Z0-9_-]+)>/g, "@\u200Busuário");
+  clean = clean.replace(/<@&([a-zA-Z0-9_-]+)>/g, "@\u200Bcargo");
+  clean = clean.replace(/<#([a-zA-Z0-9_-]+)>/g, "#\u200Bcanal");
+
+  // Neutraliza menções de broadcast
+  clean = clean.replace(/@(everyone|here|todos|online|offline)/gi, "@\u200B$1");
+
+  // Neutraliza qualquer menção a pessoas (@nome), inserindo zero-width space após o @
+  clean = clean.replace(/@(?!\u200B)([\p{L}\p{N}_])/gu, "@\u200B$1");
+
+  return clean;
 }
 
 // ========== Ligação entre mensagens (para as reações) ==========
@@ -90,7 +173,7 @@ function stripDiscordMentions(message) {
 // o resto do estado ao vivo deste bot) e limitado a um teto — como o guia de
 // reações sugere para o próprio estado de reações, aqui é o mesmo motivo:
 // sem limite, a memória cresceria pra sempre.
-const MAX_LINKED_MESSAGES = 2000;
+const MAX_LINKED_MESSAGES = 10000;
 const linkedByDiscordId = new Map(); // discordMessageId -> link
 const linkedByGoliveId = new Map(); // "groupId:channelId:messageId" -> link
 const linkOrder = [];
@@ -111,34 +194,63 @@ function linkMessages({ discordMessageId, discordChannelId, goliveGroupId, goliv
   }
 }
 
+function unlinkMessages(link) {
+  if (!link) return;
+  linkedByDiscordId.delete(link.discordMessageId);
+  linkedByGoliveId.delete(goliveMessageKey(link.goliveGroupId, link.goliveChannelId, link.goliveMessageId));
+}
+
 // ========== GoLive → Discord ==========
 // `images` e `attachments` já são URLs públicas (o CDN do GoLive) — o
 // discord.js busca uma URL sozinho quando `attachment` é uma string http(s),
 // então não precisa baixar o arquivo aqui para depois subir de novo.
-async function sendToDiscord(pair, author, text, images = [], attachments = [], goliveMessageId = null) {
-  if (!text?.trim() && images.length === 0 && attachments.length === 0) return;
+async function sendToDiscord(pair, author, text, images = [], attachments = [], goliveMessageId = null, extra = {}) {
+  try {
+    const cleanText = sanitizeGoLiveToDiscord(typeof text === "string" ? text : "");
+    const cleanImages = Array.isArray(images) ? images : [];
+    const cleanAttachments = Array.isArray(attachments) ? attachments : [];
 
-  const files = [
-    ...images.map((url) => ({ attachment: url })),
-    ...attachments.map((a) => ({ attachment: a.url, name: a.name })),
-  ];
+    const files = [
+      ...cleanImages.map((url) => ({ attachment: url })),
+      ...cleanAttachments.map((a) => ({ attachment: a.url, name: a.name })),
+    ];
 
-  const sent = await discordWebhookFor(pair).send({
-    content: text.slice(0, 2000),
-    username: author.name || author.username || "Usuário GoLive",
-    avatarURL: author.avatarUrl || undefined,
-    allowedMentions: NO_MENTIONS, // evita menções acidentais
-    ...(files.length > 0 ? { files } : {}),
-  });
+    if (extra.gifUrl) {
+      files.push({ attachment: extra.gifUrl });
+    }
 
-  if (goliveMessageId) {
-    linkMessages({
-      discordMessageId: sent.id,
-      discordChannelId: pair.discordChannelId,
-      goliveGroupId: pair.goliveGroupId,
-      goliveChannelId: pair.goliveChannelId,
-      goliveMessageId,
+    if (!cleanText.trim() && files.length === 0) return;
+
+    let content = cleanText ? cleanText.slice(0, 2000) : undefined;
+    if (extra.replyTo?.name && extra.replyTo?.text) {
+      const quoteAuthor = sanitizeGoLiveToDiscord(extra.replyTo.name);
+      const quoteText = sanitizeGoLiveToDiscord(String(extra.replyTo.text).slice(0, 100).replace(/\n/g, " "));
+      const quote = `> 💬 **${quoteAuthor}**: ${quoteText}\n`;
+      content = quote + (content || "");
+      if (content.length > 2000) content = content.slice(0, 2000);
+    }
+
+    const client = discordWebhookFor(pair);
+    const authorName = sanitizeGoLiveToDiscord(author?.name || author?.username || "Usuário GoLive").slice(0, 80);
+    const sent = await client.send({
+      content: content || undefined,
+      username: authorName,
+      avatarURL: author?.avatarUrl || undefined,
+      allowedMentions: NO_MENTIONS, // desliga completamente qualquer menção/ping
+      ...(files.length > 0 ? { files } : {}),
     });
+
+    if (goliveMessageId && sent?.id) {
+      linkMessages({
+        discordMessageId: sent.id,
+        discordChannelId: pair.discordChannelId,
+        goliveGroupId: pair.goliveGroupId,
+        goliveChannelId: pair.goliveChannelId,
+        goliveMessageId,
+      });
+    }
+  } catch (err) {
+    console.error("Erro enviando mensagem pro Discord:", err);
   }
 }
 
@@ -168,7 +280,7 @@ async function syncGoLiveWebhookAvatar(pair, discordAvatarUrl) {
   try {
     let avatar = goliveAvatarByDiscordAvatar.get(discordAvatarUrl);
     if (!avatar) {
-      const imgRes = await fetch(discordAvatarUrl);
+      const imgRes = await fetch(discordAvatarUrl, { signal: AbortSignal.timeout(5000) });
       if (!imgRes.ok) return;
       const contentType = imgRes.headers.get("content-type") || "image/png";
       const buffer = Buffer.from(await imgRes.arrayBuffer());
@@ -179,12 +291,13 @@ async function syncGoLiveWebhookAvatar(pair, discordAvatarUrl) {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ avatar }),
+      signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) {
-      console.error("Falha ao trocar a foto do webhook GoLive:", res.status, await res.text());
+      console.error("Falha ao trocar a foto do webhook GoLive:", res.status, await res.text().catch(() => ""));
       return;
     }
-    const { avatar: goliveAvatarUrl } = await res.json();
+    const { avatar: goliveAvatarUrl } = await res.json().catch(() => ({}));
     if (goliveAvatarUrl) goliveAvatarByDiscordAvatar.set(discordAvatarUrl, goliveAvatarUrl);
     currentAvatarByPair.set(pair.id, discordAvatarUrl);
   } catch (err) {
@@ -204,11 +317,16 @@ const GOLIVE_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 const GOLIVE_FILE_MAX_BYTES = 8 * 1024 * 1024;
 
 async function toDataUrl(url) {
-  const res = await fetch(url);
-  if (!res.ok) return null;
-  const contentType = res.headers.get("content-type")?.split(";")[0] || "application/octet-stream";
-  const buffer = Buffer.from(await res.arrayBuffer());
-  return { contentType, dataUrl: `data:${contentType};base64,${buffer.toString("base64")}` };
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+    if (!res.ok) return null;
+    const contentType = res.headers.get("content-type")?.split(";")[0] || "application/octet-stream";
+    const buffer = Buffer.from(await res.arrayBuffer());
+    return { contentType, dataUrl: `data:${contentType};base64,${buffer.toString("base64")}` };
+  } catch (err) {
+    console.warn(`Falha baixando anexo ${url}:`, err.message);
+    return null;
+  }
 }
 
 /** Separa os anexos de uma mensagem do Discord em fotos e arquivos pro GoLive, descartando o que passa dos limites do webhook. */
@@ -238,38 +356,78 @@ async function convertDiscordAttachments(discordAttachments) {
 
 // ========== Discord → GoLive ==========
 async function sendToGoLive(pair, message) {
-  const text = stripDiscordMentions(message);
-  const discordAttachments = [...message.attachments.values()];
-  if (!text?.trim() && discordAttachments.length === 0) return;
+  try {
+    const text = sanitizeDiscordToGoLive(message);
+    const discordAttachments = [...message.attachments.values()];
+    const stickers = message.stickers ? [...message.stickers.values()] : [];
 
-  const author = message.author;
-  await syncGoLiveWebhookAvatar(pair, author.displayAvatarURL?.({ size: 128, extension: "png" }));
-  const { images, files } = await convertDiscordAttachments(discordAttachments);
+    // Se a mensagem for resposta a outra no Discord, monta citação amigável sanitizada
+    let replyQuote = "";
+    if (message.reference?.messageId) {
+      try {
+        const refMsg = await message.channel.messages.fetch(message.reference.messageId).catch(() => null);
+        if (refMsg) {
+          const refAuthor = sanitizeDiscordToGoLive(refMsg.author?.displayName || refMsg.author?.username || "Usuário");
+          let refText = sanitizeDiscordToGoLive((refMsg.content || "").slice(0, 100).replace(/\r?\n/g, " "));
+          if (!refText && refMsg.attachments?.size > 0) refText = "[Anexo]";
+          else if (!refText && refMsg.stickers?.size > 0) refText = "[Figurinha]";
+          if (refText) {
+            replyQuote = `> 💬 **${refAuthor}**: ${refText}\n`;
+          }
+        }
+      } catch {}
+    }
 
-  // ?wait=true devolve a mensagem criada (com o id) — sem isso não dá pra
-  // ligar essa mensagem à sua correspondente no Discord para as reações.
-  // Só o username é dinâmico por mensagem; a foto agora acompanha o autor via
-  // syncGoLiveWebhookAvatar acima.
-  const res = await fetch(`${pair.goliveWebhookUrl}?wait=true`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      content: text.slice(0, 2000),
-      username: author.displayName || author.username || "Usuário Discord",
-      ...(images.length > 0 ? { images } : {}),
-      ...(files.length > 0 ? { files } : {}),
-    }),
-  });
+    if (!text?.trim() && discordAttachments.length === 0 && stickers.length === 0 && !replyQuote) return;
 
-  const sent = await res.json().catch(() => null);
-  if (sent?.id) {
-    linkMessages({
-      discordMessageId: message.id,
-      discordChannelId: pair.discordChannelId,
-      goliveGroupId: pair.goliveGroupId,
-      goliveChannelId: pair.goliveChannelId,
-      goliveMessageId: sent.id,
+    const author = message.author;
+    await syncGoLiveWebhookAvatar(pair, author.displayAvatarURL?.({ size: 128, extension: "png" }));
+    const { images, files } = await convertDiscordAttachments(discordAttachments);
+
+    // Converte figurinhas (stickers) do Discord para imagens no GoLive
+    for (const sticker of stickers) {
+      if (images.length >= GOLIVE_MAX_IMAGES) break;
+      if (sticker.url) {
+        const resolved = await toDataUrl(sticker.url);
+        if (resolved) images.push(resolved.dataUrl);
+      }
+    }
+
+    let fullContent = (replyQuote + (text || "")).slice(0, 2000);
+
+    // ?wait=true devolve a mensagem criada (com o id) — sem isso não dá pra
+    // ligar essa mensagem à sua correspondente no Discord para as reações/edições/exclusões.
+    // Só o username é dinâmico por mensagem; a foto agora acompanha o autor via
+    // syncGoLiveWebhookAvatar acima.
+    const res = await fetch(`${pair.goliveWebhookUrl}?wait=true`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        content: fullContent,
+        username: sanitizeDiscordToGoLive(author.displayName || author.username || "Usuário Discord").slice(0, 80),
+        ...(images.length > 0 ? { images } : {}),
+        ...(files.length > 0 ? { files } : {}),
+      }),
+      signal: AbortSignal.timeout(15000),
     });
+
+    if (!res.ok) {
+      console.warn(`GoLive webhook retornou status ${res.status}`);
+      return;
+    }
+
+    const sent = await res.json().catch(() => null);
+    if (sent?.id) {
+      linkMessages({
+        discordMessageId: message.id,
+        discordChannelId: pair.discordChannelId,
+        goliveGroupId: pair.goliveGroupId,
+        goliveChannelId: pair.goliveChannelId,
+        goliveMessageId: sent.id,
+      });
+    }
+  } catch (err) {
+    console.error("Erro enviando mensagem pro GoLive:", err);
   }
 }
 
@@ -310,12 +468,24 @@ const commands = [
     .setDescription("Mostra a ligação deste canal com o GoLive, se houver")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .setDMPermission(false),
+  new SlashCommandBuilder()
+    .setName("golive-invite")
+    .setDescription("Mostra os links para adicionar o bot no Discord e no GoLive"),
+  new SlashCommandBuilder()
+    .setName("golive-help")
+    .setDescription("Mostra como sincronizar canais e usar os comandos do bot"),
 ];
 
 /** Confere de novo, no servidor, que quem chamou o comando é administrador — não dá pra confiar só no setDefaultMemberPermissions (é editável pelos admins do servidor). Responde com um erro e retorna false se não for. */
 async function requireAdmin(interaction) {
-  if (interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) return true;
-  await interaction.reply({ content: "🚫 Só administradores do servidor podem usar este comando.", ephemeral: true });
+  if (!interaction.inGuild()) {
+    await interaction.reply({ content: "🚫 Este comando só pode ser usado dentro de um servidor.", ephemeral: true }).catch(() => {});
+    return false;
+  }
+  const isOwner = interaction.guild?.ownerId === interaction.user.id;
+  const hasAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
+  if (isOwner || hasAdmin) return true;
+  await interaction.reply({ content: "🚫 Só administradores do servidor podem usar este comando.", ephemeral: true }).catch(() => {});
   return false;
 }
 
@@ -323,15 +493,18 @@ const SYNC_CODE_HELP = "Gere um novo código com `/golive-sync` (Discord, sem c�
 
 /** O `id` de um webhook do GoLive, extraído do seu próprio endereço (/webhooks/<id>/<token>). */
 function goliveWebhookIdFrom(webhookUrl) {
-  const [, , id] = new URL(webhookUrl).pathname.split("/");
-  return id;
+  if (!webhookUrl) return null;
+  const match = /\/webhooks\/([a-zA-Z0-9_-]+)/.exec(webhookUrl);
+  return match ? match[1] : null;
 }
 
 async function deleteGoliveWebhook(groupId, webhookUrl) {
   const id = goliveWebhookIdFrom(webhookUrl);
+  if (!id || !groupId) return;
   await fetch(`${API}/groups/${groupId}/webhooks/${id}`, {
     method: "DELETE",
     headers: { Authorization: GOLIVE_TOKEN },
+    signal: AbortSignal.timeout(5000),
   }).catch(() => {});
 }
 
@@ -356,6 +529,7 @@ async function completeSync({ discordGuildId, discordChannelId, goliveGroupId, g
       method: "POST",
       headers: { Authorization: GOLIVE_TOKEN, "Content-Type": "application/json" },
       body: JSON.stringify({ name: "Discord" }),
+      signal: AbortSignal.timeout(10000),
     });
     if (!res.ok) {
       if (res.status === 404) {
@@ -384,6 +558,13 @@ async function completeSync({ discordGuildId, discordChannelId, goliveGroupId, g
   let discordWebhook;
   try {
     const channel = await discord.channels.fetch(discordChannelId);
+    if (!channel || !channel.isTextBased() || channel.isThread?.() || channel.isDMBased?.()) {
+      await deleteGoliveWebhook(goliveGroupId, goliveWebhookUrl);
+      return {
+        ok: false,
+        message: "O canal do Discord deve ser um canal de texto padrão do servidor (não pode ser tópico/thread, voz ou DM).",
+      };
+    }
     discordWebhook = await channel.createWebhook({ name: "GoLive Sync" });
   } catch (err) {
     console.error("Erro criando webhook no Discord:", err);
@@ -417,6 +598,29 @@ async function completeSync({ discordGuildId, discordChannelId, goliveGroupId, g
     return { ok: false, message: err.message };
   }
 
+  // Anuncia a conexão no Discord
+  try {
+    const client = discordWebhookFor(pair);
+    await client.send({
+      username: "GoLive Sync",
+      content: "🔗 **Conexão estabelecida!** As mensagens enviadas neste canal agora são sincronizadas em tempo real com o GoLive.\n*(Bot em Beta Teste • Suporte: <http://discord.gg/nemtudo>)*",
+      allowedMentions: NO_MENTIONS,
+    }).catch(() => {});
+  } catch {}
+
+  // Anuncia a conexão no GoLive
+  try {
+    await fetch(pair.goliveWebhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: "GoLive Sync",
+        content: "🔗 **Conexão estabelecida!** As mensagens enviadas nesta sala agora são sincronizadas em tempo real com o Discord.\n*(Bot em Beta Teste • Suporte: http://discord.gg/nemtudo)*",
+      }),
+      signal: AbortSignal.timeout(10000),
+    }).catch(() => {});
+  } catch {}
+
   return { ok: true, pair };
 }
 
@@ -426,33 +630,91 @@ const SYNC_DONE_MESSAGE = "✅ Ligado! As mensagens (e fotos e arquivos) agora v
 //
 // @mencionar o bot num canal do Discord ou numa sala do GoLive responde com
 // isto — pra quem esbarra nele sem ter lido nenhuma documentação.
-const TUTORIAL_DISCORD = [
-  "👋 Eu ligo um canal daqui a uma sala do GoLive: depois de ligados, toda mensagem (com fotos e arquivos) vai e volta entre os dois sozinha.",
-  "",
-  "**Para ligar este canal a uma sala do GoLive:**",
-  "1. Aqui, rode `/golive-sync` sem nada — eu gero um código.",
-  "2. Na sala do GoLive que você quer ligar, digite `!golive-sync <código>`.",
-  "",
-  "(Também funciona começando pelo GoLive: `!golive-sync` lá, depois `/golive-sync codigo:<código>` aqui.)",
-  "",
-  "**Outros comandos:** `/golive-status` (mostra a ligação deste canal) e `/golive-unlink` (desliga).",
-  "",
-  "Preciso da permissão **Gerenciar Webhooks** aqui, e minha conta do GoLive precisa da permissão **Gerenciar webhooks** no grupo que você quer ligar.",
-].join("\n");
+// ========== Painel de Ajuda em Embed ==========
+function createHelpEmbed() {
+  return new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle("🌐 Sincronização Discord ↔ GoLive")
+    .setDescription(
+      "Ponte em tempo real entre canais de texto do Discord e salas do GoLive. Mensagens, fotos, figurinhas, arquivos, respostas, edições e reações são espelhadas automaticamente!"
+    )
+    .addFields(
+      {
+        name: "🚀 Como Vincular",
+        value:
+          "**1.** No Discord, use `/golive-sync` (sem nada) para gerar um código de 6 caracteres.\n" +
+          "**2.** Na sala desejada do GoLive, digite `!golive-sync <código>`.\n\n" +
+          "*(Também funciona no sentido oposto: gere com `!golive-sync` no GoLive e use `/golive-sync codigo:<código>` no Discord!)*",
+      },
+      {
+        name: "📜 Comandos no Discord",
+        value:
+          "• `/golive-sync` — Gera código ou vincula canal\n" +
+          "• `/golive-unlink` — Desconecta o canal atual\n" +
+          "• `/golive-status` — Exibe a sala vinculada a este canal\n" +
+          "• `/golive-invite` — Links para adicionar o bot\n" +
+          "• `/golive-help` — Exibe este painel de ajuda",
+        inline: true,
+      },
+      {
+        name: "💬 Comandos no GoLive",
+        value:
+          "• `!golive-sync [código]` — Gera código ou vincula sala\n" +
+          "• `!golive-unlink` — Desconecta a sala atual\n" +
+          "• `!golive-status` — Exibe o canal vinculado a esta sala\n" +
+          "• `!golive-invite` — Links para adicionar o bot\n" +
+          "• `!golive-help` — Exibe este painel de ajuda",
+        inline: true,
+      },
+      {
+        name: "🔒 Permissões & Segurança",
+        value:
+          "• **Discord:** O bot precisa da permissão **Gerenciar Webhooks** no canal.\n" +
+          "• **GoLive:** A conta do bot precisa da permissão **Gerenciar webhooks** no grupo.\n" +
+          "• Apenas administradores podem vincular ou desvincular canais.",
+      },
+      {
+        name: "🔗 Links Úteis",
+        value: `• [Adicionar ao Discord](${DISCORD_INVITE_URL})\n• [Adicionar ao GoLive](${GOLIVE_INVITE_URL})`,
+      },
+      {
+        name: "🧪 Versão Beta & Suporte",
+        value:
+          "Este bot está atualmente em **Beta Teste**.\n" +
+          "Caso precise de ajuda ou queira relatar algum problema, entre em contato abrindo um ticket no servidor oficial do **NemTudo** no Discord:\n" +
+          `👉 [discord.gg/nemtudo](${SUPPORT_SERVER_URL})`,
+      }
+    )
+    .setFooter({ text: "Ponte Discord ↔ GoLive (Beta) • Suporte: discord.gg/nemtudo" })
+    .setTimestamp();
+}
 
-const TUTORIAL_GOLIVE = [
-  "👋 Eu ligo esta sala a um canal do Discord: depois de ligados, toda mensagem (com fotos e arquivos) vai e volta entre os dois sozinha.",
-  "",
-  "**Para ligar esta sala a um canal do Discord:**",
-  "1. Aqui, digite `!golive-sync` sem nada — eu gero um código.",
-  "2. No canal do Discord que você quer ligar, rode `/golive-sync codigo:<código>`.",
-  "",
-  "(Também funciona começando pelo Discord: `/golive-sync` lá, depois `!golive-sync <código>` aqui.)",
-  "",
-  "**Outros comandos (no Discord):** `/golive-status` e `/golive-unlink`.",
-  "",
-  'Preciso da permissão "Gerenciar webhooks" aqui neste grupo, e minha conta do Discord precisa da permissão Gerenciar Webhooks no canal que você quer ligar.',
-].join("\n");
+async function handleHelp(interaction) {
+  await interaction.reply({
+    embeds: [createHelpEmbed()],
+    components: [createInviteButtons()],
+    ephemeral: true,
+  });
+}
+
+async function handleInvite(interaction) {
+  const content = [
+    "🤖 **Links para adicionar o bot:**",
+    "",
+    `• **Discord:** [Clique para adicionar ao Discord](${DISCORD_INVITE_URL})`,
+    `• **GoLive:** [Clique para adicionar ao GoLive](${GOLIVE_INVITE_URL})`,
+    "",
+    "🧪 **Aviso de Beta Teste:**",
+    "O bot está em fase de testes. Caso precise de suporte ou queira reportar problemas, abra um ticket no servidor oficial do NemTudo no Discord:",
+    `• **Suporte:** [discord.gg/nemtudo](${SUPPORT_SERVER_URL})`,
+  ].join("\n");
+
+  await interaction.reply({
+    content,
+    components: [createInviteButtons()],
+    ephemeral: true,
+  });
+}
 
 async function handleSync(interaction) {
   await interaction.deferReply({ ephemeral: true });
@@ -490,6 +752,28 @@ async function handleUnlink(interaction) {
   const pair = await removePairByDiscordChannel(interaction.channelId);
   if (!pair) return interaction.editReply("Este canal não está ligado a nenhuma sala do GoLive.");
 
+  // Avisa em ambos os canais antes de deletar os webhooks
+  try {
+    const discordClient = discordWebhookFor(pair);
+    await discordClient.send({
+      username: "GoLive Sync",
+      content: "🔌 **Sincronização encerrada.** As mensagens deste canal não serão mais espelhadas no GoLive.",
+      allowedMentions: NO_MENTIONS,
+    }).catch(() => {});
+  } catch {}
+
+  try {
+    await fetch(pair.goliveWebhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: "GoLive Sync",
+        content: "🔌 **Sincronização encerrada.** As mensagens desta sala não serão mais espelhadas no Discord.",
+      }),
+      signal: AbortSignal.timeout(5000),
+    }).catch(() => {});
+  } catch {}
+
   currentAvatarByPair.delete(pair.id);
   await deleteGoliveWebhook(pair.goliveGroupId, pair.goliveWebhookUrl);
   const discordClient = discordWebhookClients.get(pair.discordWebhookUrl);
@@ -526,6 +810,14 @@ discord.on("ready", async () => {
 discord.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   try {
+    if (interaction.commandName === "golive-invite") {
+      await handleInvite(interaction);
+      return;
+    }
+    if (interaction.commandName === "golive-help") {
+      await handleHelp(interaction);
+      return;
+    }
     if (!(await requireAdmin(interaction))) return;
     if (interaction.commandName === "golive-sync") await handleSync(interaction);
     else if (interaction.commandName === "golive-unlink") await handleUnlink(interaction);
@@ -542,15 +834,74 @@ discord.on("messageCreate", async (message) => {
   if (message.author.bot) return;
   if (message.webhookId) return; // evita loop de webhooks
 
-  if (message.mentions.has(discord.user)) {
-    return void message.reply({ content: TUTORIAL_DISCORD, allowedMentions: NO_MENTIONS }).catch(() => {});
+  // Apenas responde a ajuda se o bot for DIRETAMENTE mencionado no texto (não @everyone, não @here, não cargo e não reply automático)
+  const isDirectBotMention =
+    discord.user &&
+    message.mentions.has(discord.user, { ignoreEveryone: true, ignoreRoles: true, ignoreRepliedUser: true }) &&
+    (message.content.includes(`<@${discord.user.id}>`) || message.content.includes(`<@!${discord.user.id}>`));
+
+  if (isDirectBotMention) {
+    return void message
+      .reply({
+        embeds: [createHelpEmbed()],
+        allowedMentions: NO_MENTIONS,
+        components: [createInviteButtons()],
+      })
+      .catch(() => {});
   }
 
   const pair = findByDiscordChannel(message.channelId);
   if (!pair) return; // canal não ligado a nenhuma sala do GoLive
-  if (!message.content && message.attachments.size === 0) return;
+  const hasStickers = message.stickers && message.stickers.size > 0;
+  if (!message.content && message.attachments.size === 0 && !hasStickers) return;
 
-  await sendToGoLive(pair, message);
+  await sendToGoLive(pair, message).catch((err) => console.error("Erro em sendToGoLive:", err));
+});
+
+discord.on("messageUpdate", async (oldMessage, newMessage) => {
+  try {
+    if (newMessage.partial) {
+      try {
+        await newMessage.fetch();
+      } catch {
+        return;
+      }
+    }
+    if (newMessage.author?.bot || newMessage.webhookId) return;
+
+    // Se o conteúdo textual não mudou (ex: apenas unfurl de embeds pelo Discord), ignora
+    if (oldMessage.content === newMessage.content) return;
+
+    const link = linkedByDiscordId.get(newMessage.id);
+    if (!link) return;
+
+    const text = sanitizeDiscordToGoLive(newMessage);
+    await fetch(`${API}/groups/${link.goliveGroupId}/channels/${link.goliveChannelId}/messages/${link.goliveMessageId}`, {
+      method: "PATCH",
+      headers: { Authorization: GOLIVE_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({ text: text.slice(0, 2000) }),
+      signal: AbortSignal.timeout(10000),
+    }).catch((err) => console.error("Erro sincronizando edição pro GoLive:", err));
+  } catch (err) {
+    console.error("Erro em messageUpdate Discord:", err);
+  }
+});
+
+discord.on("messageDelete", async (message) => {
+  try {
+    const link = linkedByDiscordId.get(message.id);
+    if (!link) return;
+
+    unlinkMessages(link);
+
+    await fetch(`${API}/groups/${link.goliveGroupId}/channels/${link.goliveChannelId}/messages/${link.goliveMessageId}`, {
+      method: "DELETE",
+      headers: { Authorization: GOLIVE_TOKEN },
+      signal: AbortSignal.timeout(10000),
+    }).catch((err) => console.error("Erro sincronizando exclusão pro GoLive:", err));
+  } catch (err) {
+    console.error("Erro em messageDelete Discord:", err);
+  }
 });
 
 // ========== Reações (Discord → GoLive) ==========
@@ -559,19 +910,26 @@ discord.on("messageCreate", async (message) => {
 // então "espelhar" é: enquanto pelo menos uma pessoa de verdade tiver aquele
 // emoji na mensagem original, a conta do bot mantém o mesmo emoji na mensagem
 // ligada do outro lado; quando a última pessoa tira o dela, o bot tira o seu.
-async function handleDiscordReactionChange(reaction, user) {
+async function handleDiscordReactionChange(reaction, user, isRemove = false) {
   if (user.bot) return;
   try {
-    if (reaction.partial) await reaction.fetch();
+    if (reaction.partial) {
+      try {
+        await reaction.fetch();
+      } catch {
+        // Se a reação foi toda removida antes do fetch, ignoramos erro do fetch
+      }
+    }
   } catch {
     return;
   }
-  if (reaction.emoji.id) return; // emoji personalizado — o GoLive só aceita unicode
+  if (reaction.emoji?.id) return; // emoji personalizado — o GoLive só aceita unicode
 
   const link = linkedByDiscordId.get(reaction.message.id);
   if (!link) return;
 
-  const hasReal = reaction.count - (reaction.me ? 1 : 0) > 0;
+  const count = reaction.count ?? 0;
+  const hasReal = isRemove ? count > 0 : count - (reaction.me ? 1 : 0) > 0;
   try {
     await fetch(
       `${API}/groups/${link.goliveGroupId}/channels/${link.goliveChannelId}/messages/${link.goliveMessageId}/reactions`,
@@ -579,6 +937,7 @@ async function handleDiscordReactionChange(reaction, user) {
         method: "POST",
         headers: { Authorization: GOLIVE_TOKEN, "Content-Type": "application/json" },
         body: JSON.stringify({ emoji: reaction.emoji.name, on: hasReal }),
+        signal: AbortSignal.timeout(5000),
       }
     );
   } catch (err) {
@@ -586,32 +945,35 @@ async function handleDiscordReactionChange(reaction, user) {
   }
 }
 
-discord.on("messageReactionAdd", handleDiscordReactionChange);
-discord.on("messageReactionRemove", handleDiscordReactionChange);
+discord.on("messageReactionAdd", (reaction, user) => handleDiscordReactionChange(reaction, user, false));
+discord.on("messageReactionRemove", (reaction, user) => handleDiscordReactionChange(reaction, user, true));
 
-// ========== Comando do lado do GoLive (!golive-sync) ==========
+// ========== Comandos do lado do GoLive (!golive-*) ==========
 //
 // O GoLive não tem comandos de barra — um bot lê o texto das mensagens e
 // decide (ver docs/guia/comandos.md). `!golive-sync` é o espelho do
 // /golive-sync do Discord: sem argumento gera um código, com um código
 // completa uma sincronização começada do lado do Discord.
+// `!golive-unlink` e `!golive-status` dão autonomia aos admins do GoLive.
 const GOLIVE_SYNC_PREFIX = "!golive-sync";
 
 /** Responde na mesma sala, citando o comando — sem notificar (é uma resposta automática). */
-async function goliveReply(message, text) {
+async function goliveReply(message, text, extra = {}) {
   await fetch(`${API}/groups/${message.groupId}/channels/${message.channelId}/messages`, {
     method: "POST",
     headers: { Authorization: GOLIVE_TOKEN, "Content-Type": "application/json" },
     body: JSON.stringify({
-      text,
-      replyTo: { id: message.id, name: message.fromName, text: message.text.slice(0, 200), kind: message.kind },
+      text: typeof text === "string" ? text : "",
+      replyTo: { id: message.id, name: message.fromName, text: (message.text || "").slice(0, 200), kind: message.kind },
+      ...(extra.embeds ? { embeds: extra.embeds } : {}),
     }),
+    signal: AbortSignal.timeout(10000),
   }).catch((err) => console.error("Erro respondendo no GoLive:", err));
 }
 
-async function handleGoliveSyncCommand(message, author) {
+async function handleGoliveSyncCommand(message, author, text) {
   if (findByGoliveChannel(message.groupId, message.channelId)) {
-    return goliveReply(message, "Esta sala já está ligada a um canal do Discord. Desligue com `/golive-unlink` no Discord primeiro.");
+    return goliveReply(message, "Esta sala já está ligada a um canal do Discord. Desligue com `!golive-unlink` aqui ou `/golive-unlink` no Discord primeiro.");
   }
 
   const groupData = await fetchGroup(API, GOLIVE_TOKEN, message.groupId);
@@ -619,7 +981,8 @@ async function handleGoliveSyncCommand(message, author) {
     return goliveReply(message, "🚫 Você precisa ser **administrador** deste grupo pra ligar esta sala ao Discord.");
   }
 
-  const code = message.text.trim().slice(GOLIVE_SYNC_PREFIX.length).trim();
+  const raw = typeof text === "string" ? text : message.text || "";
+  const code = raw.trim().slice(GOLIVE_SYNC_PREFIX.length).trim();
   if (!code) {
     const generated = startFromGolive(message.groupId, message.channelId);
     return goliveReply(
@@ -641,6 +1004,64 @@ async function handleGoliveSyncCommand(message, author) {
     createdBy: author.id,
   });
   await goliveReply(message, result.ok ? SYNC_DONE_MESSAGE : `❌ ${result.message}`);
+}
+
+async function handleGoliveUnlinkCommand(message, author) {
+  const groupData = await fetchGroup(API, GOLIVE_TOKEN, message.groupId);
+  if (!groupData || !isAdmin(groupData, author.id)) {
+    return goliveReply(message, "🚫 Você precisa ser **administrador** deste grupo pra desvincular esta sala do Discord.");
+  }
+
+  const pair = await removePairByGoliveChannel(message.groupId, message.channelId);
+  if (!pair) {
+    return goliveReply(message, "Esta sala não está ligada a nenhum canal do Discord.");
+  }
+
+  // Avisa em ambos os canais antes de deletar os webhooks
+  try {
+    const discordClient = discordWebhookFor(pair);
+    await discordClient.send({
+      username: "GoLive Sync",
+      content: "🔌 **Sincronização encerrada.** As mensagens deste canal não serão mais espelhadas no GoLive.",
+      allowedMentions: NO_MENTIONS,
+    }).catch(() => {});
+  } catch {}
+
+  try {
+    await fetch(pair.goliveWebhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: "GoLive Sync",
+        content: "🔌 **Sincronização encerrada.** As mensagens desta sala não serão mais espelhadas no Discord.",
+      }),
+      signal: AbortSignal.timeout(5000),
+    }).catch(() => {});
+  } catch {}
+
+  currentAvatarByPair.delete(pair.id);
+  await deleteGoliveWebhook(pair.goliveGroupId, pair.goliveWebhookUrl);
+  const discordClient = discordWebhookClients.get(pair.discordWebhookUrl);
+  discordWebhookClients.delete(pair.discordWebhookUrl);
+  await (discordClient ?? new WebhookClient({ url: pair.discordWebhookUrl }))
+    .delete("Desligado pelo GoLive")
+    .catch(() => {});
+
+  return goliveReply(message, "✅ Sala desligada do Discord.");
+}
+
+async function handleGoliveStatusCommand(message, author) {
+  const groupData = await fetchGroup(API, GOLIVE_TOKEN, message.groupId);
+  if (!groupData || !isAdmin(groupData, author.id)) {
+    return goliveReply(message, "🚫 Você precisa ser **administrador** deste grupo pra ver o status da sincronização.");
+  }
+
+  const pair = findByGoliveChannel(message.groupId, message.channelId);
+  if (!pair) {
+    return goliveReply(message, "Esta sala não está ligada a nenhum canal do Discord.");
+  }
+  const since = new Date(pair.createdAt).toLocaleString("pt-BR");
+  return goliveReply(message, `ℹ️ Ligada ao canal do Discord \`${pair.discordChannelId}\` desde ${since}.`);
 }
 
 // ========== Reações (GoLive → Discord) ==========
@@ -693,7 +1114,14 @@ function connectGoLive() {
   });
 
   ws.on("message", async (data) => {
-    const event = JSON.parse(data.toString());
+    let event;
+    try {
+      event = JSON.parse(data.toString());
+    } catch (err) {
+      console.warn("Evento WebSocket inválido recebido do GoLive:", err);
+      return;
+    }
+    if (!event || typeof event !== "object") return;
 
     if (event.type === "registered") {
       console.log("GoLive conectado!");
@@ -703,22 +1131,105 @@ function connectGoLive() {
 
     if (event.type === "group-message") {
       const { message, author } = event;
+      if (!message || !author) return;
 
       // Ignora bots e webhooks (evita loop)
       if (author.bot || author.webhook) return;
 
-      if (meId && message.mentions?.includes(meId)) {
-        return goliveReply(message, TUTORIAL_GOLIVE);
+      const rawText = (message.text || "").trim();
+      // Remove menção do bot no início se houver (ex: "@bot !golive-sync")
+      const cleanedCommandText = meId
+        ? rawText.replace(new RegExp(`^<@!?${meId}>\\s*`), "").trim()
+        : rawText;
+      const lower = cleanedCommandText.toLowerCase();
+
+      if (lower.startsWith(GOLIVE_SYNC_PREFIX)) {
+        return handleGoliveSyncCommand(message, author, cleanedCommandText);
+      }
+      if (lower.startsWith("!golive-unlink")) {
+        return handleGoliveUnlinkCommand(message, author);
+      }
+      if (lower.startsWith("!golive-status")) {
+        return handleGoliveStatusCommand(message, author);
+      }
+      if (lower.startsWith("!golive-invite")) {
+        return goliveReply(
+          message,
+          `🤖 **Links para adicionar o bot:**\n• **Discord:** ${DISCORD_INVITE_URL}\n• **GoLive:** ${GOLIVE_INVITE_URL}\n\n🧪 **Beta Teste & Suporte:**\nEste bot está em fase de testes. Caso precise de ajuda ou queira relatar bugs, abra um ticket no servidor do **NemTudo** no Discord:\n👉 ${SUPPORT_SERVER_URL}`
+        );
+      }
+      if (lower.startsWith("!golive-help")) {
+        return goliveReply(message, "", { embeds: [createHelpEmbed().toJSON()] });
       }
 
-      if (message.text?.trim().toLowerCase().startsWith(GOLIVE_SYNC_PREFIX)) {
-        return handleGoliveSyncCommand(message, author);
+      // Se mencionou o bot diretamente no texto e não é comando
+      if (meId && message.mentions?.includes(meId) && message.text?.includes(`<@${meId}>`)) {
+        return goliveReply(message, "", { embeds: [createHelpEmbed().toJSON()] });
       }
 
       const pair = findByGoliveChannel(message.groupId, message.channelId);
       if (!pair) return; // sala não ligada a nenhum canal do Discord
 
-      await sendToDiscord(pair, author, message.text, message.images ?? [], message.attachments ?? [], message.id);
+      await sendToDiscord(
+        pair,
+        author,
+        message.text,
+        message.images ?? [],
+        message.attachments ?? [],
+        message.id,
+        {
+          gifUrl: message.kind === "gif" ? message.url : undefined,
+          replyTo: message.replyTo,
+        }
+      );
+      return;
+    }
+
+    if (event.type === "group-message-updated") {
+      const { groupId, channelId, message } = event;
+      if (!groupId || !channelId || !message?.id) return;
+
+      const key = goliveMessageKey(groupId, channelId, message.id);
+      const link = linkedByGoliveId.get(key);
+      if (!link) return;
+
+      const pair = findByGoliveChannel(groupId, channelId);
+      if (!pair) return;
+
+      try {
+        const client = discordWebhookFor(pair);
+        const cleanText = sanitizeGoLiveToDiscord(typeof message.text === "string" ? message.text : "").slice(0, 2000);
+        if (cleanText) {
+          await client.editMessage(link.discordMessageId, {
+            content: cleanText,
+            allowedMentions: NO_MENTIONS,
+          }).catch(() => {});
+        }
+      } catch (err) {
+        console.error("Erro sincronizando edição pro Discord:", err);
+      }
+      return;
+    }
+
+    if (event.type === "group-message-deleted") {
+      const { groupId, channelId, messageId } = event;
+      if (!groupId || !channelId || !messageId) return;
+
+      const key = goliveMessageKey(groupId, channelId, messageId);
+      const link = linkedByGoliveId.get(key);
+      if (!link) return;
+
+      unlinkMessages(link);
+
+      const pair = findByGoliveChannel(groupId, channelId);
+      if (!pair) return;
+
+      try {
+        const client = discordWebhookFor(pair);
+        await client.deleteMessage(link.discordMessageId).catch(() => {});
+      } catch (err) {
+        console.error("Erro sincronizando exclusão pro Discord:", err);
+      }
       return;
     }
 

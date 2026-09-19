@@ -37,6 +37,12 @@ setInterval(sweepExpired, 60_000).unref?.();
 /** Gera um código novo para o lado do Discord (guildId é só informativo, pra logs/depuração). */
 export function startFromDiscord(guildId, channelId) {
   sweepExpired();
+  // Limpa qualquer código pendente anterior deste mesmo canal
+  for (const [key, val] of pending) {
+    if (val.side === "discord" && val.discord?.channelId === channelId) {
+      pending.delete(key);
+    }
+  }
   const code = makeCode();
   pending.set(code, { side: "discord", discord: { guildId, channelId }, expiresAt: Date.now() + CODE_TTL_MS });
   return code;
@@ -45,6 +51,12 @@ export function startFromDiscord(guildId, channelId) {
 /** Gera um código novo para o lado do GoLive. */
 export function startFromGolive(groupId, channelId) {
   sweepExpired();
+  // Limpa qualquer código pendente anterior desta mesma sala
+  for (const [key, val] of pending) {
+    if (val.side === "golive" && val.golive?.groupId === groupId && val.golive?.channelId === channelId) {
+      pending.delete(key);
+    }
+  }
   const code = makeCode();
   pending.set(code, { side: "golive", golive: { groupId, channelId }, expiresAt: Date.now() + CODE_TTL_MS });
   return code;
@@ -58,6 +70,7 @@ export function startFromGolive(groupId, channelId) {
  * alguém sem uma segunda chance por ter digitado no lugar errado primeiro.
  */
 export function consumeSync(code, side) {
+  if (typeof code !== "string" || !code.trim()) return null;
   const normalized = code.trim().toUpperCase();
   const entry = pending.get(normalized);
   if (!entry) return null;

@@ -54,20 +54,24 @@ vencer.
 | Discord | `/golive-sync` | Gera um código para este canal (sem argumento) ou completa uma ligação com o código de uma sala do GoLive (`codigo:`). |
 | Discord | `/golive-unlink` | Desliga o canal atual e apaga os dois webhooks. |
 | Discord | `/golive-status` | Mostra a qual sala do GoLive o canal atual está ligado, se houver. |
+| Discord | `/golive-invite` | Exibe os botões e links para adicionar o bot ao Discord e ao GoLive. |
+| Discord | `/golive-help` | Exibe o painel de ajuda em embed com instruções e lista de comandos. |
 | GoLive | `!golive-sync` | O espelho do `/golive-sync` do Discord — sem argumento gera um código, com um código completa. |
+| GoLive | `!golive-unlink` | Desliga a sala atual do Discord e apaga os dois webhooks. |
+| GoLive | `!golive-status` | Mostra a qual canal do Discord a sala atual está ligada, se houver. |
+| GoLive | `!golive-invite` | Exibe os links para adicionar o bot ao Discord e ao GoLive. |
+| GoLive | `!golive-help` | Exibe o painel de ajuda em embed e instruções de uso. |
 
-Todos os comandos exigem **administrador**: os três comandos do Discord (o
-próprio Discord bloqueia quem não tem, mas o bot confere de novo do lado dele,
-já que um admin do servidor pode liberar o comando pra mais gente nas
-configurações de Integrações) e `!golive-sync` confere que quem digitou é
-administrador do grupo no GoLive antes de fazer qualquer coisa (ver
-`golivePermissions.js`).
+Os comandos de configuração e sincronização (`/golive-sync`, `/golive-unlink`, `/golive-status`, `!golive-sync`, `!golive-unlink`, `!golive-status`) exigem **administrador**: no Discord exigem
+administrador ou dono do servidor (e são respondidos de forma efêmera e privada),
+e no GoLive conferem se quem digitou é o dono do grupo ou possui cargo
+com a permissão `administrator` antes de executar qualquer ação (ver `golivePermissions.js`). Os comandos de ajuda e convite (`/golive-help`, `/golive-invite`, `!golive-help`, `!golive-invite`) podem ser consultados livremente.
 
 ## O que é sincronizado, e como
 
 Uma vez ligados, `index.js` ouve as duas pontas:
 
-- **Discord → GoLive** (`messageCreate`): texto, e anexos convertidos para o
+- **Discord → GoLive** (`messageCreate`): texto, respostas/citações a mensagens anteriores, figurinhas (stickers convertidas em fotos) e anexos convertidos para o
   formato que o webhook do GoLive aceita — `images` (fotos, como data URL) e
   `files` (qualquer outro tipo, também como data URL), respeitando os limites
   do webhook (3 fotos/5 MB cada, 5 arquivos/8 MB cada — ver
@@ -76,9 +80,11 @@ Uma vez ligados, `index.js` ouve as duas pontas:
   a documentação do GoLive, `docs/guia/webhooks.md`) — com um cache que evita
   subir a mesma foto duas vezes quando a mesma pessoa volta a falar depois de
   outra.
-- **GoLive → Discord** (evento `group-message` do WebSocket): texto, fotos e
+- **GoLive → Discord** (evento `group-message` do WebSocket): texto, citações de respostas (`replyTo`), fotos e
   arquivos, mandados pro `WebhookClient` do Discord — que busca as URLs do
   CDN do GoLive direto, sem baixar e re-enviar nada.
+- **Edição e Exclusão Bidirecional**: quando uma mensagem vinculada é editada ou apagada no Discord, a alteração/exclusão correspondente é enviada imediatamente à sala do GoLive; reciprocamente, quando uma mensagem é editada ou excluída no GoLive, o bot edita ou apaga a mensagem espelhada no Discord.
+- **Avisos de Conexão e Desconexão**: ao concluir uma ligação com sucesso, ambos os canais recebem um anúncio de conexão estabelecida; ao desvincular (`/golive-unlink` ou `!golive-unlink`), ambos os canais recebem um aviso amigável de desconexão antes da remoção dos webhooks.
 - **Reações**, nas duas direções: como o bot só pode mexer na própria reação
   (nunca na de outra pessoa — regra de ambas as plataformas), "espelhar" é
   manter o mesmo emoji da conta do bot na mensagem ligada do outro lado
@@ -89,19 +95,12 @@ Uma vez ligados, `index.js` ouve as duas pontas:
 Mensagens de outros webhooks e bots nunca são retransmitidas — é o que evita
 um eco infinito entre os dois lados.
 
-### Menções
+### Bloqueio de Menções (Everyone e Pessoas)
 
-Nenhum lado consegue notificar `@everyone`/`@here`, cargos ou uma pessoa
-através do outro — só o texto atravessa, nunca o poder de notificar:
+Nenhum lado consegue notificar `@everyone`, `@here`, `@todos`, cargos ou pessoas específicas através do outro aplicativo:
 
-- **Discord → GoLive:** o webhook do GoLive já não aceita menções de
-  jeito nenhum (não notifica ninguém — ver `docs/guia/webhooks.md`), mas a
-  sintaxe de menção em texto é idêntica à do Discord (`<@id>`, `<#id>`), então
-  o bot troca cada menção do Discord por texto simples (`@nome`, `#canal`)
-  antes de mandar, e quebra `@everyone`/`@here` digitados à mão.
-- **GoLive → Discord:** toda mensagem que o webhook manda vai com
-  `allowedMentions: { parse: [] }`, que desliga a notificação de
-  `@everyone`/`@here`, cargos e pessoas não importa o que vier no texto.
+- **Discord → GoLive:** Qualquer token de menção (`<@id>`, `<@&id>`, `<#id>`) ou menção em texto (`@everyone`, `@here`, `@todos`, `@online`, `@offline`, e qualquer `@Nome` de usuário) recebe um espaço invisível de largura zero (`@\u200BNome`). Com isso, a mensagem permanece legível visualmente, mas o GoLive **nunca** a interpreta como menção, não gera notificações push, nem alertas sonoros de menção na sala.
+- **GoLive → Discord:** Qualquer menção de broadcast (`@everyone`, `@here`, `@todos`, etc.), tokens `<@id>` ou menção a usuários (`@Nome`) também é neutralizada com zero-width space antes de ser enviada ao Discord. Além disso, o envio do webhook utiliza `allowedMentions: { parse: [], users: [], roles: [], repliedUser: false }`, garantindo que nenhuma menção ou ping atinja membros no Discord.
 
 ## Requisitos de permissão
 
@@ -144,3 +143,11 @@ node index.js
 Os comandos de barra do Discord são registrados globalmente ao conectar
 (`discord.application.commands.set`) — uma mudança neles pode levar até uma
 hora para aparecer em todo lugar, é assim que o Discord funciona.
+
+## 🧪 Versão Beta & Suporte
+
+Este bot está atualmente em fase de **Beta Teste**. Se você encontrar qualquer inconsistência, bug ou precisar de suporte na configuração dos canais ou permissões:
+
+- Abra um **ticket de suporte** no servidor oficial do **NemTudo** no Discord:
+  👉 **[discord.gg/nemtudo](http://discord.gg/nemtudo)**
+

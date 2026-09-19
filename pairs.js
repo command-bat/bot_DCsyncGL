@@ -23,7 +23,9 @@ function reindex() {
 }
 
 async function save() {
-  await fs.writeFile(FILE, JSON.stringify(pairs, null, 2));
+  const tmp = `${FILE}.${Date.now()}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(pairs, null, 2), "utf8");
+  await fs.rename(tmp, FILE);
 }
 
 /** Carrega as ligações salvas. Chamar uma vez, antes de conectar em qualquer lado. */
@@ -32,7 +34,11 @@ export async function loadPairs() {
     const raw = await fs.readFile(FILE, "utf8");
     pairs = JSON.parse(raw);
   } catch (err) {
-    if (err.code !== "ENOENT") console.error("Erro lendo pairs.json:", err);
+    if (err.code !== "ENOENT") {
+      console.error("Erro lendo ou parseando pairs.json:", err);
+      // Se já tínhamos pares em memória, preserva para não zerar por falha temporária
+      if (pairs.length > 0) return pairs;
+    }
     pairs = [];
   }
   reindex();
@@ -72,6 +78,16 @@ export async function addPair(pair) {
 /** Remove a ligação do canal do Discord dado. Devolve a ligação removida, ou null se não havia nenhuma. */
 export async function removePairByDiscordChannel(channelId) {
   const pair = byDiscordChannel.get(channelId) ?? null;
+  if (!pair) return null;
+  pairs = pairs.filter((p) => p.id !== pair.id);
+  reindex();
+  await save();
+  return pair;
+}
+
+/** Remove a ligação da sala do GoLive dada. Devolve a ligação removida, ou null se não havia nenhuma. */
+export async function removePairByGoliveChannel(groupId, channelId) {
+  const pair = byGoliveChannel.get(goliveKey(groupId, channelId)) ?? null;
   if (!pair) return null;
   pairs = pairs.filter((p) => p.id !== pair.id);
   reindex();
